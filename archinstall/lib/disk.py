@@ -2,7 +2,6 @@ import glob
 import pathlib
 import re
 import time
-from collections import OrderedDict
 from typing import Optional
 
 from .general import *
@@ -14,10 +13,195 @@ GPT = 0b00000001
 MBR = 0b00000010
 
 
-# import ctypes
-# import ctypes.util
-# libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
-# libc.mount.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_char_p)
+def valid_parted_position(pos :str):
+	if not len(pos):
+		return False
+
+	if pos.isdigit():
+		return True
+
+	if pos[-1] == '%' and pos[:-1].isdigit():
+		return True
+
+	if pos[-3:].lower() in ['mib', 'kib', 'b', 'tib'] and pos[:-3].replace(".", "", 1).isdigit():
+		return True
+
+	if pos[-2:].lower() in ['kb', 'mb', 'gb', 'tb'] and pos[:-2].replace(".", "", 1).isdigit():
+		return True
+
+	return False
+
+def valid_fs_type(fstype :str) -> bool:
+	# https://www.gnu.org/software/parted/manual/html_node/mkpart.html
+	# Above link doesn't agree with `man parted` /mkpart documentation:
+	"""
+		fs-type can
+		be  one  of  "btrfs",  "ext2",
+		"ext3",    "ext4",    "fat16",
+		"fat32",    "hfs",     "hfs+",
+		"linux-swap",  "ntfs",  "reis‐
+		erfs", "udf", or "xfs".
+	"""
+
+	return fstype.lower() in [
+		"btrfs",
+		"ext2",
+		"ext3", "ext4", # `man parted` allows these
+		"fat16", "fat32",
+		"hfs", "hfs+", # "hfsx", not included in `man parted`
+		"linux-swap",
+		"ntfs",
+		"reiserfs",
+		"udf", # "ufs", not included in `man parted`
+		"xfs", # `man parted` allows this
+	]
+
+
+def sort_block_devices_based_on_performance(block_devices):
+	result = {device: 0 for device in block_devices}
+
+	for device, weight in result.items():
+		if device.spinning:
+			weight -= 10
+		else:
+			weight += 5
+
+		if device.bus_type == 'nvme':
+			weight += 20
+		elif device.bus_type == 'sata':
+			weight += 10
+
+		result[device] = weight
+
+	return result
+
+def select_disk_larger_than_or_close_to(devices, gigabytes, filter_out=None):
+	if not filter_out:
+		filter_out = []
+
+	copy_devices = [*devices]
+	for filter_device in filter_out:
+		if filter_device in copy_devices:
+			copy_devices.pop(copy_devices.index(filter_device))
+
+	if not len(copy_devices):
+		return None
+
+	return min(copy_devices, key=(lambda device : abs(device.size - 40)))
+
+def suggest_single_disk_layout(block_device):
+	MIN_SIZE_TO_ALLOW_HOME_PART = 40 # Gb
+
+	layout = {
+		block_device : {
+			"wipe" : True,
+			"partitions" : []
+		}
+	}
+
+	layout[block_device]['partitions'].append({
+		# Boot
+		"type" : "primary",
+		"start" : "1MiB",
+		"size" : "513MiB",
+		"boot" : True,
+		"encrypted" : False,
+		"format" : True,
+		"mountpoint" : "/boot",
+		"filesystem" : {
+			"format" : "fat32"
+		}
+	})
+	layout[block_device]['partitions'].append({
+		# Root
+		"type" : "primary",
+		"start" : "513MiB",
+		"encrypted" : False,
+		"format" : True,
+		"size" : "100%" if block_device.size < MIN_SIZE_TO_ALLOW_HOME_PART else f"{min(block_device.size, 20)*1024}MiB",
+		"mountpoint" : "/",
+		"filesystem" : {
+			"format" : "btrfs"
+		}
+	})
+
+	if block_device.size > MIN_SIZE_TO_ALLOW_HOME_PART:
+		layout[block_device]['partitions'].append({
+			# Home
+			"type" : "primary",
+			"encrypted" : False,
+			"format" : True,
+			"start" : f"{min(block_device.size*0.2, 20)*1024}MiB",
+			"size" : "100%",
+			"mountpoint" : "/home",
+			"filesystem" : {
+				"format" : "btrfs"
+			}
+		})
+
+	return layout
+
+
+def suggest_multi_disk_layout(block_devices):
+	MIN_SIZE_TO_ALLOW_HOME_PART = 40 # Gb
+
+	block_devices = sort_block_devices_based_on_performance(block_devices).keys()
+
+	root_device = select_disk_larger_than_or_close_to(block_devices, gigabytes=MIN_SIZE_TO_ALLOW_HOME_PART)
+	home_device = select_disk_larger_than_or_close_to(block_devices, gigabytes=MIN_SIZE_TO_ALLOW_HOME_PART, filter_out=[root_device])
+
+
+	layout = {
+		root_device : {
+			"wipe" : True,
+			"partitions" : []
+		},
+		home_device : {
+			"wipe" : True,
+			"partitions" : []
+		},
+	}
+
+	layout[root_device]['partitions'].append({
+		# Boot
+		"type" : "primary",
+		"start" : "1MiB",
+		"size" : "513MiB",
+		"boot" : True,
+		"encrypted" : False,
+		"format" : True,
+		"mountpoint" : "/boot",
+		"filesystem" : {
+			"format" : "fat32"
+		}
+	})
+	layout[root_device]['partitions'].append({
+		# Root
+		"type" : "primary",
+		"start" : "513MiB",
+		"encrypted" : False,
+		"format" : True,
+		"size" : "100%",
+		"mountpoint" : "/",
+		"filesystem" : {
+			"format" : "btrfs"
+		}
+	})
+
+	layout[home_device]['partitions'].append({
+		# Home
+		"type" : "primary",
+		"encrypted" : False,
+		"format" : True,
+		"start" : "4MiB",
+		"size" : "100%",
+		"mountpoint" : "/home",
+		"filesystem" : {
+			"format" : "btrfs"
+		}
+	})
+
+	return layout
 
 
 class BlockDevice:
@@ -30,14 +214,14 @@ class BlockDevice:
 		self.path = path
 		self.info = info
 		self.keep_partitions = True
-		self.part_cache = OrderedDict()
+		self.part_cache = {}
+
 		# TODO: Currently disk encryption is a BIT misleading.
 		#       It's actually partition-encryption, but for future-proofing this
 		#       I'm placing the encryption password on a BlockDevice level.
-		self.encryption_password = None
 
 	def __repr__(self, *args, **kwargs):
-		return f"BlockDevice({self.device})"
+		return f"BlockDevice({self.device}, size={self.size}GB, free_space={'+'.join(part[2] for part in self.free_space)}, bus_type={self.bus_type})"
 
 	def __iter__(self):
 		for partition in self.partitions:
@@ -48,23 +232,34 @@ class BlockDevice:
 			raise KeyError(f'{self} does not contain information: "{key}"')
 		return self.info[key]
 
+	def __len__(self):
+		return len(self.partitions)
+
+	def __lt__(self, left_comparitor):
+		return self.path < left_comparitor.path
+
 	def json(self):
 		"""
 		json() has precedence over __dump__, so this is a way
 		to give less/partial information for user readability.
 		"""
-		return {
-			'path': self.path,
-			'size': self.info['size'] if 'size' in self.info else '<unknown>',
-			'model': self.info['model'] if 'model' in self.info else '<unknown>'
-		}
+		return self.path
 
 	def __dump__(self):
 		return {
-			'path': self.path,
-			'info': self.info,
-			'partition_cache': self.part_cache
+			self.path : {
+				'partuuid' : self.uuid,
+				'wipe' : self.info.get('wipe', None),
+				'partitions' : [part.__dump__() for part in self.partitions.values()]
+			}
 		}
+
+	@property
+	def partition_type(self):
+		output = json.loads(SysCommand(f"lsblk --json -o+PTTYPE {self.path}").decode('UTF-8'))
+	
+		for device in output['blockdevices']:
+			return device['pttype']
 
 	@property
 	def device(self):
@@ -78,7 +273,7 @@ class BlockDevice:
 			raise DiskError(f'Could not locate backplane info for "{self.path}"')
 
 		if self.info['type'] == 'loop':
-			for drive in json.loads(b''.join(SysCommand(['losetup', '--json'])).decode('UTF_8'))['loopdevices']:
+			for drive in json.loads(SysCommand(['losetup', '--json']).decode('UTF_8'))['loopdevices']:
 				if not drive['name'] == self.path:
 					continue
 
@@ -100,18 +295,17 @@ class BlockDevice:
 
 	@property
 	def partitions(self):
-		o = b''.join(SysCommand(['partprobe', self.path]))
+		SysCommand(['partprobe', self.path])
 
-		# o = b''.join(sys_command('/usr/bin/lsblk -o name -J -b {dev}'.format(dev=dev)))
-		o = b''.join(SysCommand(['/usr/bin/lsblk', '-J', self.path]))
+		result = SysCommand(['/usr/bin/lsblk', '-J', self.path])
 
-		if b'not a block device' in o:
+		if b'not a block device' in result:
 			raise DiskError(f'Can not read partitions off something that isn\'t a block device: {self.path}')
 
-		if not o[:1] == b'{':
+		if not result[:1] == b'{':
 			raise DiskError('Error getting JSON output from:', f'/usr/bin/lsblk -J {self.path}')
 
-		r = json.loads(o.decode('UTF-8'))
+		r = json.loads(result.decode('UTF-8'))
 		if len(r['blockdevices']) and 'children' in r['blockdevices'][0]:
 			root_path = f"/dev/{r['blockdevices'][0]['name']}"
 			for part in r['blockdevices'][0]['children']:
@@ -140,9 +334,50 @@ class BlockDevice:
 		This is more reliable than relying on /dev/disk/by-partuuid as
 		it doesn't seam to be able to detect md raid partitions.
 		"""
-		lsblk = b''.join(SysCommand(f'lsblk -J -o+UUID {self.path}'))
-		for partition in json.loads(lsblk.decode('UTF-8'))['blockdevices']:
+		for partition in json.loads(SysCommand(f'lsblk -J -o+UUID {self.path}').decode('UTF-8'))['blockdevices']:
 			return partition.get('uuid', None)
+
+	@property
+	def size(self):
+		output = json.loads(SysCommand(f"lsblk --json -o+SIZE {self.path}").decode('UTF-8'))
+	
+		for device in output['blockdevices']:
+			assert device['size'][-1] == 'G' # Make sure we're counting in Gigabytes, otherwise the next logic fails.
+
+			return float(device['size'][:-1])
+
+	@property
+	def bus_type(self):
+		output = json.loads(SysCommand(f"lsblk --json -o+ROTA,TRAN {self.path}").decode('UTF-8'))
+	
+		for device in output['blockdevices']:
+			return device['tran']
+	
+	@property
+	def spinning(self):
+		output = json.loads(SysCommand(f"lsblk --json -o+ROTA,TRAN {self.path}").decode('UTF-8'))
+	
+		for device in output['blockdevices']:
+			return device['rota'] is True
+
+	@property
+	def free_space(self):
+		for line in SysCommand(f"parted --machine {self.path} print free"):
+			if 'free' in (free_space := line.decode('UTF-8')):
+				_, start, end, size, *_ = free_space.strip('\r\n;').split(':')
+				yield (start, end, size)
+
+	@property
+	def largest_free_space(self):
+		info = None
+		for space_info in self.free_space:
+			if not info:
+				info = space_info
+			else:
+				# [-1] = size
+				if space_info[-1] > info[-1]:
+					info = space_info
+		return info
 
 	def has_partitions(self):
 		return len(self.partitions)
@@ -154,7 +389,12 @@ class BlockDevice:
 		return False
 
 	def flush_cache(self):
-		self.part_cache = OrderedDict()
+		self.part_cache = {}
+
+	def get_partition(self, uuid):
+		for partition in self:
+			if partition.uuid == uuid:
+				return partition
 
 
 class Partition:
@@ -171,7 +411,7 @@ class Partition:
 		self.size = size  # TODO: Refresh?
 		self._encrypted = None
 		self.encrypted = encrypted
-		self.allow_formatting = False  # A fail-safe for unconfigured partitions, such as windows NTFS partitions.
+		self.allow_formatting = False
 
 		if mountpoint:
 			self.mount(mountpoint)
@@ -206,9 +446,80 @@ class Partition:
 			mount_repr = f", rel_mountpoint={self.target_mountpoint}"
 
 		if self._encrypted:
-			return f'Partition(path={self.path}, size={self.size}, real_device={self.real_device}, fs={self.filesystem}{mount_repr})'
+			return f'Partition(path={self.path}, size={self.size}, PARTUUID={self.uuid}, parent={self.real_device}, fs={self.filesystem}{mount_repr})'
 		else:
-			return f'Partition(path={self.path}, size={self.size}, fs={self.filesystem}{mount_repr})'
+			return f'Partition(path={self.path}, size={self.size}, PARTUUID={self.uuid}, fs={self.filesystem}{mount_repr})'
+
+	def __dump__(self):
+		return {
+			'type' : 'primary',
+			'PARTUUID' : self.uuid,
+			'wipe' : self.allow_formatting,
+			'boot' : self.boot,
+			'ESP' : self.boot,
+			'mountpoint' : self.target_mountpoint,
+			'encrypted' : self._encrypted,
+			'start' : self.start,
+			'size' : self.end,
+			'filesystem' : {
+				'format' : get_filesystem_type(self.path)
+			}
+		}
+
+	@property
+	def sector_size(self):
+		output = json.loads(SysCommand(f"lsblk --json -o+LOG-SEC {self.path}").decode('UTF-8'))
+		
+		for device in output['blockdevices']:
+			return device.get('log-sec', None)
+
+	@property
+	def start(self):
+		output = json.loads(SysCommand(f"sfdisk --json {self.block_device.path}").decode('UTF-8'))
+	
+		for partition in output.get('partitiontable', {}).get('partitions', []):
+			if partition['node'] == self.path:
+				return partition['start']# * self.sector_size
+
+	@property
+	def end(self):
+		# TODO: Verify that the logic holds up, that 'size' is the size without 'start' added to it.
+		output = json.loads(SysCommand(f"sfdisk --json {self.block_device.path}").decode('UTF-8'))
+
+		for partition in output.get('partitiontable', {}).get('partitions', []):
+			if partition['node'] == self.path:
+				return partition['size']# * self.sector_size
+
+	@property
+	def boot(self):
+		output = json.loads(SysCommand(f"sfdisk --json {self.block_device.path}").decode('UTF-8'))
+
+		# Get the bootable flag from the sfdisk output:
+		# {
+		#    "partitiontable": {
+		#       "label":"dos",
+		#       "id":"0xd202c10a",
+		#       "device":"/dev/loop0",
+		#       "unit":"sectors",
+		#       "sectorsize":512,
+		#       "partitions": [
+		#          {"node":"/dev/loop0p1", "start":2048, "size":10483712, "type":"83", "bootable":true}
+		#       ]
+		#    }
+		# }
+
+		for partition in output.get('partitiontable', {}).get('partitions', []):
+			if partition['node'] == self.path:
+				return partition.get('bootable', False)
+
+		return False
+
+	@property
+	def partition_type(self):
+		lsblk = json.loads(SysCommand(f"lsblk --json -o+PTTYPE {self.path}").decode('UTF-8'))
+	
+		for device in lsblk['blockdevices']:
+			return device['pttype']
 
 	@property
 	def uuid(self) -> Optional[str]:
@@ -217,8 +528,9 @@ class Partition:
 		This is more reliable than relying on /dev/disk/by-partuuid as
 		it doesn't seam to be able to detect md raid partitions.
 		"""
-		lsblk = b''.join(SysCommand(f'lsblk -J -o+PARTUUID {self.path}'))
-		for partition in json.loads(lsblk.decode('UTF-8'))['blockdevices']:
+
+		lsblk = json.loads(SysCommand(f'lsblk -J -o+PARTUUID {self.path}').decode('UTF-8'))
+		for partition in lsblk['blockdevices']:
 			return partition.get('partuuid', None)
 		return None
 
@@ -237,7 +549,7 @@ class Partition:
 
 	@property
 	def real_device(self):
-		for blockdevice in json.loads(b''.join(SysCommand('lsblk -J')).decode('UTF-8'))['blockdevices']:
+		for blockdevice in json.loads(SysCommand('lsblk -J').decode('UTF-8'))['blockdevices']:
 			if parent := self.find_parent_of(blockdevice, os.path.basename(self.path)):
 				return f"/dev/{parent}"
 		# 	raise DiskError(f'Could not find appropriate parent for encrypted partition {self}')
@@ -248,7 +560,7 @@ class Partition:
 		from .luks import luks2
 
 		try:
-			with luks2(self, 'luksloop', password, auto_unmount=True) as unlocked_device:
+			with luks2(self, storage.get('ENC_IDENTIFIER', 'ai')+'loop', password, auto_unmount=True) as unlocked_device:
 				return unlocked_device.filesystem
 		except SysCallError:
 			return None
@@ -274,39 +586,16 @@ class Partition:
 
 		return True if files > 0 else False
 
-	def safe_to_format(self):
-		if self.allow_formatting is False:
-			log(f"Partition {self} is not marked for formatting.", level=logging.DEBUG)
-			return False
-		elif self.target_mountpoint == '/boot':
-			try:
-				if self.has_content():
-					log(f"Partition {self} is a boot partition and has content inside.", level=logging.DEBUG)
-					return False
-			except SysCallError as err:
-				log(err.message, logging.DEBUG)
-				log(f"Partition {self} was identified as /boot but we could not mount to check for content, continuing!", level=logging.DEBUG)
-				pass
-
-		return True
-
 	def encrypt(self, *args, **kwargs):
 		"""
 		A wrapper function for luks2() instances and the .encrypt() method of that instance.
 		"""
 		from .luks import luks2
 
-		if not self._encrypted:
-			raise DiskError(f"Attempting to encrypt a partition that was not marked for encryption: {self}")
-
-		if not self.safe_to_format():
-			log(f"Partition {self} was marked as protected but encrypt() was called on it!", level=logging.ERROR, fg="red")
-			return False
-
 		handle = luks2(self, None, None)
 		return handle.encrypt(self, *args, **kwargs)
 
-	def format(self, filesystem=None, path=None, allow_formatting=None, log_formatting=True):
+	def format(self, filesystem=None, path=None, log_formatting=True):
 		"""
 		Format can be given an overriding path, for instance /dev/null to test
 		the formatting functionality and in essence the support for the given filesystem.
@@ -316,52 +605,46 @@ class Partition:
 
 		if path is None:
 			path = self.path
-		if allow_formatting is None:
-			allow_formatting = self.allow_formatting
 
 		# To avoid "unable to open /dev/x: No such file or directory"
 		start_wait = time.time()
 		while pathlib.Path(path).exists() is False and time.time() - start_wait < 10:
 			time.sleep(0.025)
 
-		if not allow_formatting:
-			raise PermissionError(f"{self} is not formatable either because instance is locked ({self.allow_formatting}) or a blocking flag was given ({allow_formatting})")
-
 		if log_formatting:
 			log(f'Formatting {path} -> {filesystem}', level=logging.INFO)
 
 		if filesystem == 'btrfs':
-			o = b''.join(SysCommand(f'/usr/bin/mkfs.btrfs -f {path}'))
-			if b'UUID' not in o:
-				raise DiskError(f'Could not format {path} with {filesystem} because: {o}')
-			self.filesystem = 'btrfs'
+			if 'UUID:' not in (mkfs := SysCommand(f'/usr/bin/mkfs.btrfs -f {path}').decode('UTF-8')):
+				raise DiskError(f'Could not format {path} with {filesystem} because: {mkfs}')
+			self.filesystem = filesystem
 
-		elif filesystem == 'vfat':
-			o = b''.join(SysCommand(f'/usr/bin/mkfs.vfat -F32 {path}'))
-			if (b'mkfs.fat' not in o and b'mkfs.vfat' not in o) or b'command not found' in o:
-				raise DiskError(f'Could not format {path} with {filesystem} because: {o}')
-			self.filesystem = 'vfat'
+		elif filesystem == 'fat32':
+			mkfs = SysCommand(f'/usr/bin/mkfs.vfat -F32 {path}').decode('UTF-8')
+			if ('mkfs.fat' not in mkfs and 'mkfs.vfat' not in mkfs) or 'command not found' in mkfs:
+				raise DiskError(f"Could not format {path} with {filesystem} because: {mkfs}")
+			self.filesystem = filesystem
 
 		elif filesystem == 'ext4':
 			if (handle := SysCommand(f'/usr/bin/mkfs.ext4 -F {path}')).exit_code != 0:
-				raise DiskError(f'Could not format {path} with {filesystem} because: {b"".join(handle)}')
-			self.filesystem = 'ext4'
+				raise DiskError(f"Could not format {path} with {filesystem} because: {handle.decode('UTF-8')}")
+			self.filesystem = filesystem
 
 		elif filesystem == 'xfs':
 			if (handle := SysCommand(f'/usr/bin/mkfs.xfs -f {path}')).exit_code != 0:
-				raise DiskError(f'Could not format {path} with {filesystem} because: {b"".join(handle)}')
-			self.filesystem = 'xfs'
+				raise DiskError(f"Could not format {path} with {filesystem} because: {handle.decode('UTF-8')}")
+			self.filesystem = filesystem
 
 		elif filesystem == 'f2fs':
 			if (handle := SysCommand(f'/usr/bin/mkfs.f2fs -f {path}')).exit_code != 0:
-				raise DiskError(f'Could not format {path} with {filesystem} because: {b"".join(handle)}')
-			self.filesystem = 'f2fs'
+				raise DiskError(f"Could not format {path} with {filesystem} because: {handle.decode('UTF-8')}")
+			self.filesystem = filesystem
 
 		elif filesystem == 'crypto_LUKS':
 			# 	from .luks import luks2
 			# 	encrypted_partition = luks2(self, None, None)
 			# 	encrypted_partition.format(path)
-			self.filesystem = 'crypto_LUKS'
+			self.filesystem = filesystem
 
 		else:
 			raise UnknownFilesystemFormat(f"Fileformat '{filesystem}' is not yet implemented.")
@@ -393,9 +676,9 @@ class Partition:
 
 			try:
 				if options:
-					SysCommand(f'/usr/bin/mount -o {options} {self.path} {target}')
+					SysCommand(f"/usr/bin/mount -o {options} {self.path} {target}")
 				else:
-					SysCommand(f'/usr/bin/mount {self.path} {target}')
+					SysCommand(f"/usr/bin/mount {self.path} {target}")
 			except SysCallError as err:
 				raise err
 
@@ -404,7 +687,7 @@ class Partition:
 
 	def unmount(self):
 		try:
-			exit_code = SysCommand(f'/usr/bin/umount {self.path}').exit_code
+			SysCommand(f"/usr/bin/umount {self.path}")
 		except SysCallError as err:
 			exit_code = err.exit_code
 
@@ -476,8 +759,64 @@ class Filesystem:
 		# TODO: https://stackoverflow.com/questions/28157929/how-to-safely-handle-an-exception-inside-a-context-manager
 		if len(args) >= 2 and args[1]:
 			raise args[1]
-		b''.join(SysCommand('sync'))
+		SysCommand('sync')
 		return True
+
+	def load_layout(self, layout :dict):
+		from .luks import luks2
+
+		# If the layout tells us to wipe the drive, we do so
+		if layout.get('wipe', False):
+			if self.mode == GPT:
+				if not self.parted_mklabel(self.blockdevice.device, "gpt"):
+					raise KeyError(f"Could not create a GPT label on {self}")
+			elif self.mode == MBR:
+				if not self.parted_mklabel(self.blockdevice.device, "msdos"):
+					raise KeyError(f"Could not create a MSDOS label on {self}")
+
+		# We then iterate the partitions in order
+		for partition in layout.get('partitions', []):
+			# We don't want to re-add an existing partition (those containing a UUID already)
+			if partition.get('format', False) and not partition.get('PARTUUID', None):
+				partition['device_instance'] = self.add_partition(partition.get('type', 'primary'),
+																	start=partition.get('start', '1MiB'), # TODO: Revisit sane block starts (4MB for memorycards for instance)
+																	end=partition.get('size', '100%'),
+																	partition_format=partition.get('filesystem', {}).get('format', 'btrfs'))
+
+			elif (partition_uuid := partition.get('PARTUUID')) and (partition_instance := self.blockdevice.get_partition(uuid=partition_uuid)):
+				partition['device_instance'] = partition_instance
+			else:
+				raise ValueError(f"{self}.load_layout() doesn't know how to continue without a new partition definition or a UUID ({partition.get('PARTUUID')}) on the device ({self.blockdevice.get_partition(uuid=partition_uuid)}).")
+
+			if partition.get('filesystem', {}).get('format', False):
+				if partition.get('encrypted', False):
+					if not partition.get('password'):
+						if storage['arguments'] == 'silent':
+							raise ValueError(f"Missing encryption password for {partition['device_instance']}")
+						else:
+							from .user_interaction import get_password
+							partition['password'] = get_password(f"Enter a encryption password for {partition['device_instance']}")
+
+					partition['device_instance'].encrypt(password=partition['password'])
+					with luks2(partition['device_instance'], storage.get('ENC_IDENTIFIER', 'ai')+'loop', partition['password']) as unlocked_device:
+						if not partition.get('format'):
+							if storage['arguments'] == 'silent':
+								raise ValueError(f"Missing fs-type to format on newly created encrypted partition {partition['device_instance']}")
+							else:
+								if not partition.get('filesystem'):
+									partition['filesystem'] = {}
+
+								if not partition['filesystem'].get('format', False):
+									while True:
+										partition['filesystem']['format'] = input(f"Enter a valid fs-type for newly encrypted partition {partition['filesystem']['format']}: ").strip()
+										if not partition['filesystem']['format'] or valid_fs_type(partition['filesystem']['format']) is False:
+											pint("You need to enter a valid fs-type in order to continue. See `man parted` for valid fs-type's.")
+											continue
+										break
+
+						unlocked_device.format(partition['filesystem']['format'])
+				elif partition.get('format', False):
+					partition['device_instance'].format(partition['filesystem']['format'])
 
 	def find_partition(self, mountpoint):
 		for partition in self.blockdevice:
@@ -485,8 +824,9 @@ class Filesystem:
 				return partition
 
 	def raw_parted(self, string: str):
-		x = SysCommand(f'/usr/bin/parted -s {string}')
-		return x
+		if (cmd_handle := SysCommand(f'/usr/bin/parted -s {string}')).exit_code != 0:
+			log(f"Could not generate partition: {cmd_handle}", level=logging.ERROR, fg="red")
+		return cmd_handle
 
 	def parted(self, string: str):
 		"""
@@ -495,56 +835,37 @@ class Filesystem:
 		:param string: A raw string passed to /usr/bin/parted -s <string>
 		:type string: str
 		"""
-		return self.raw_parted(string).exit_code
+		return self.raw_parted(string).exit_code == 0
 
-	def use_entire_disk(self, root_filesystem_type='ext4'):
-		log(f"Using and formatting the entire {self.blockdevice}.", level=logging.DEBUG)
-		if has_uefi():
-			self.add_partition('primary', start='1MiB', end='513MiB', partition_format='fat32')
-			self.set_name(0, 'EFI')
-			self.set(0, 'boot on')
-			# TODO: Probably redundant because in GPT mode 'esp on' is an alias for "boot on"?
-			# https://www.gnu.org/software/parted/manual/html_node/set.html
-			self.set(0, 'esp on')
-			self.add_partition('primary', start='513MiB', end='100%')
-
-			self.blockdevice.partition[0].filesystem = 'vfat'
-			self.blockdevice.partition[1].filesystem = root_filesystem_type
-			log(f"Set the root partition {self.blockdevice.partition[1]} to use filesystem {root_filesystem_type}.", level=logging.DEBUG)
-
-			self.blockdevice.partition[0].target_mountpoint = '/boot'
-			self.blockdevice.partition[1].target_mountpoint = '/'
-
-			self.blockdevice.partition[0].allow_formatting = True
-			self.blockdevice.partition[1].allow_formatting = True
-		else:
-			# we don't need a seprate boot partition it would be a waste of space
-			self.add_partition('primary', start='1MB', end='100%')
-			self.blockdevice.partition[0].filesystem = root_filesystem_type
-			log(f"Set the root partition {self.blockdevice.partition[0]} to use filesystem {root_filesystem_type}.", level=logging.DEBUG)
-			self.blockdevice.partition[0].target_mountpoint = '/'
-			self.blockdevice.partition[0].allow_formatting = True
+	def use_entire_disk(self, root_filesystem_type='ext4') -> Partition:
+		# TODO: Implement this with declarative profiles instead.
+		raise ValueError("Installation().use_entire_disk() has to be re-worked.")
 
 	def add_partition(self, partition_type, start, end, partition_format=None):
-		log(f'Adding partition to {self.blockdevice}', level=logging.INFO)
+		log(f'Adding partition to {self.blockdevice}, {start}->{end}', level=logging.INFO)
 
-		previous_partitions = self.blockdevice.partitions
+		previous_partition_uuids = {partition.uuid for partition in self.blockdevice.partitions.values()}
+
 		if self.mode == MBR:
 			if len(self.blockdevice.partitions) > 3:
 				DiskError("Too many partitions on disk, MBR disks can only have 3 parimary partitions")
-		if partition_format:
-			partitioning = self.parted(f'{self.blockdevice.device} mkpart {partition_type} {partition_format} {start} {end}') == 0
-		else:
-			partitioning = self.parted(f'{self.blockdevice.device} mkpart {partition_type} {start} {end}') == 0
 
-		if partitioning:
+		if partition_format:
+			parted_string = f'{self.blockdevice.device} mkpart {partition_type} {partition_format} {start} {end}'
+		else:
+			parted_string = f'{self.blockdevice.device} mkpart {partition_type} {start} {end}'
+
+		if self.parted(parted_string):
 			start_wait = time.time()
-			while previous_partitions == self.blockdevice.partitions:
-				time.sleep(0.025)  # Let the new partition come up in the kernel
+			while previous_partition_uuids == {partition.uuid for partition in self.blockdevice.partitions.values()}:
 				if time.time() - start_wait > 10:
 					raise DiskError(f"New partition never showed up after adding new partition on {self} (timeout 10 seconds).")
+				time.sleep(0.025)
 
-			return True
+
+			time.sleep(0.5) # Let the kernel catch up with quick block devices (nvme for instance)
+			return self.blockdevice.get_partition(uuid=(previous_partition_uuids ^ {partition.uuid for partition in self.blockdevice.partitions.values()}).pop())
+
 
 	def set_name(self, partition: int, name: str):
 		return self.parted(f'{self.blockdevice.device} name {partition + 1} "{name}"') == 0
@@ -553,6 +874,7 @@ class Filesystem:
 		return self.parted(f'{self.blockdevice.device} set {partition + 1} {string}') == 0
 
 	def parted_mklabel(self, device: str, disk_label: str):
+		log(f"Creating a new partition labling on {device}", level=logging.INFO, fg="yellow")
 		# Try to unmount devices before attempting to run mklabel
 		try:
 			SysCommand(f'bash -c "umount {device}?"')
@@ -582,9 +904,10 @@ def device_state(name, *args, **kwargs):
 # lsblk --json -l -n -o path
 def all_disks(*args, **kwargs):
 	kwargs.setdefault("partitions", False)
-	drives = OrderedDict()
-	# for drive in json.loads(sys_command(f'losetup --json', *args, **lkwargs, hide_from_log=True)).decode('UTF_8')['loopdevices']:
-	for drive in json.loads(b''.join(SysCommand('lsblk --json -l -n -o path,size,type,mountpoint,label,pkname,model')).decode('UTF_8'))['blockdevices']:
+	drives = {}
+
+	lsblk = json.loads(SysCommand('lsblk --json -l -n -o path,size,type,mountpoint,label,pkname,model').decode('UTF_8'))
+	for drive in lsblk['blockdevices']:
 		if not kwargs['partitions'] and drive['type'] == 'part':
 			continue
 
@@ -617,11 +940,9 @@ def harddrive(size=None, model=None, fuzzy=False):
 
 def get_mount_info(path) -> dict:
 	try:
-		output = SysCommand(f'/usr/bin/findmnt --json {path}')
+		output = SysCommand(f'/usr/bin/findmnt --json {path}').decode('UTF-8')
 	except SysCallError:
 		return {}
-
-	output = output.decode('UTF-8')
 
 	if not output:
 		return {}
@@ -636,13 +957,11 @@ def get_mount_info(path) -> dict:
 
 def get_partitions_in_use(mountpoint) -> list:
 	try:
-		output = SysCommand(f'/usr/bin/findmnt --json -R {mountpoint}')
+		output = SysCommand(f"/usr/bin/findmnt --json -R {mountpoint}").decode('UTF-8')
 	except SysCallError:
 		return []
 
 	mounts = []
-
-	output = output.decode('UTF-8')
 
 	if not output:
 		return []
@@ -659,16 +978,26 @@ def get_partitions_in_use(mountpoint) -> list:
 
 def get_filesystem_type(path):
 	try:
-		handle = SysCommand(f"blkid -o value -s TYPE {path}")
-		return b''.join(handle).strip().decode('UTF-8')
+		return SysCommand(f"blkid -o value -s TYPE {path}").decode('UTF-8').strip()
 	except SysCallError:
 		return None
 
 
 def disk_layouts():
 	try:
-		handle = SysCommand("lsblk -f -o+TYPE,SIZE -J")
-		return json.loads(b''.join(handle).decode('UTF-8'))
+		return json.loads(SysCommand("lsblk -f -o+TYPE,SIZE -J").decode('UTF-8'))
 	except SysCallError as err:
 		log(f"Could not return disk layouts: {err}")
 		return None
+
+
+def encrypted_partitions(blockdevices :dict) -> bool:
+	for partition in blockdevices.values():
+		if partition.get('encrypted', False):
+			yield partition
+
+def find_partition_by_mountpoint(block_devices, relative_mountpoint :str):
+	for device in block_devices:
+		for partition in block_devices[device]['partitions']:
+			if partition.get('mountpoint', None) == relative_mountpoint:
+				return partition
