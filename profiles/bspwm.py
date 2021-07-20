@@ -8,6 +8,7 @@ __packages__ = [
     "bspwm",
     "sxhkd",
 	"xdo",
+	"rxvt-unicode",
 ]
 
 def _prep_function(*args, **kwargs):
