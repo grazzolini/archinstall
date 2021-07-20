@@ -26,6 +26,7 @@ __supported__ = [
 	'kde',
 	'awesome',
 	'sway',
+	'bspwm',
 	'cinnamon',
 	'xfce4',
 	'lxqt',
