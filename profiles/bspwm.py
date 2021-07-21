@@ -9,6 +9,8 @@ __packages__ = [
     "sxhkd",
 	"xdo",
 	"rxvt-unicode",
+	"lightdm-gtk-greeter",
+	"lightdm",
 ]
 
 def _prep_function(*args, **kwargs):
